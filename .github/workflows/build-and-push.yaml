@@ -1,0 +1,102 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write  # This is required for requesting the JWT
+  contents: read   # This is required for actions/checkout
+  packages: write  # This is required for Docker push
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t eliza-starter:${{ github.sha }} .
+
+      - name: List Docker images
+        run: docker images
+
+      - name: Package Docker image
+        run: |
+          docker save -o /tmp/${{ github.sha }}.tar eliza-starter:${{ github.sha }}
+
+      - name: Save Docker image as artifact
+        id: save_image
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp/${{ github.sha }}.tar
+
+  private-push:
+    name: Push Docker Images to AWS
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [testnet]
+        image: [eliza-starter]
+        include:
+          # - environment: devnet
+          #   aws_account_id: ${{ vars.ZKMR_DEVNET_AWS_ACCOUNT_ID }}
+          - environment: testnet
+            aws_account_id: ${{ vars.ZKMR_TESTNET_AWS_ACCOUNT_ID }}
+          # - environment: mainnet
+          #   aws_account_id: ${{ vars.ZKMR_MAINNET_AWS_ACCOUNT_ID }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ matrix.aws_account_id }}:role/github-actions-ecr-access-role
+          role-session-name: github-actions-ecr-access-role
+          aws-region: ${{ vars.ZKMR_AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download Docker image from artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Load Docker image
+        run: |
+          docker load -i /tmp/${{ github.sha }}.tar
+
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag ${{ matrix.image }}:${{ github.sha }} $ECR_REGISTRY/${{ matrix.image }}:${{ github.sha }}
+          docker push $ECR_REGISTRY/${{ matrix.image }}:${{ github.sha }}
